@@ -209,11 +209,12 @@ def po_to_nevra(po):
     else:
         return '%s-%s-%s.%s' % (po.name, po.version, po.release, po.arch)
 
-def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None, is_pkg=False):
+def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None, is_pkg=False, group=False):
     if en_repos is None:
         en_repos = []
     if dis_repos is None:
         dis_repos = []
+
     if not repoq:
 
         pkgs = []
@@ -235,7 +236,12 @@ def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, di
 
     else:
 
-        cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf, pkgspec]
+        if group:
+            cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf]
+            cmd.extend(pkgspec)
+        else:
+            cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf, pkgspec]
+
         rc,out,err = module.run_command(cmd)
         if not is_pkg:
             cmd = repoq + ["--disablerepo=*", "--pkgnarrow=installed", "--qf", qf, "--whatprovides", pkgspec]
@@ -251,7 +257,7 @@ def is_installed(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, di
             
     return []
 
-def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None):
+def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None, group=False):
     if en_repos is None:
         en_repos = []
     if dis_repos is None:
@@ -285,7 +291,14 @@ def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, di
         r_cmd = ['--enablerepo', ','.join(en_repos)]
         myrepoq.extend(r_cmd)
 
-        cmd = myrepoq + ["--qf", qf, pkgspec]
+        if group:
+            myrepoq.remove("--show-duplicates")
+            myrepoq.append("--pkgnarrow=available")
+            cmd = myrepoq + ["--qf", qf]
+            cmd.extend(pkgspec)
+        else:
+            cmd = myrepoq + ["--qf", qf, pkgspec]
+
         rc,out,err = module.run_command(cmd)
         if rc == 0:
             return [ p for p in out.split('\n') if p.strip() ]
@@ -294,7 +307,7 @@ def is_available(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, di
 
     return []
 
-def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None):
+def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_repos=None, group=False):
     if en_repos is None:
         en_repos = []
     if dis_repos is None:
@@ -335,7 +348,13 @@ def is_update(module, repoq, pkgspec, conf_file, qf=def_qf, en_repos=None, dis_r
         r_cmd = ['--enablerepo', ','.join(en_repos)]
         myrepoq.extend(r_cmd)
 
-        cmd = myrepoq + ["--pkgnarrow=updates", "--qf", qf, pkgspec]
+        if group:
+            myrepoq.remove("--show-duplicates")
+            cmd = myrepoq + ["--pkgnarrow=updates", "--qf", qf]
+            cmd.extend(pkgspec)
+        else:
+            cmd = myrepoq + ["--pkgnarrow=updates", "--qf", qf, pkgspec]
+
         rc,out,err = module.run_command(cmd)
         
         if rc == 0:
@@ -503,6 +522,43 @@ def list_stuff(module, repoquerybin, conf_file, stuff):
     else:
         return [ pkg_to_dict(p) for p in is_installed(module, repoq, stuff, conf_file, qf=qf) + is_available(module, repoq, stuff, conf_file, qf=qf) if p.strip() ]
 
+def expand_group(module, repoq, group, en_repos, dis_repos):
+
+    group_name = group.replace('@', '')
+
+    r_cmd = ""
+    if dis_repos:
+      r_cmd += "--disablerepo=%s" % ','.join(dis_repos)
+    if en_repos:
+      r_cmd += "--enablerepo=%s" % ",".join(en_repos)
+
+    # List the packages provided by group
+    cmd = repoq + [r_cmd, "-g", "-l", group_name]
+    rc,out,err = module.run_command(cmd)
+
+    return [ p for p in out.split('\n') if p.strip() ]
+
+def group_has_available(module, repoq, group, conf_file, en_repos, dis_repos):
+
+    myqf =  '%{name}'
+
+    # Get packages provided by group
+    pkgs = expand_group(module, repoq, group, en_repos, dis_repos)
+
+    # Find which packages are already installed
+    ipkgs = is_installed(module, repoq, pkgs, conf_file, qf=myqf, en_repos=en_repos, dis_repos=dis_repos, is_pkg=True, group=True)
+
+    # Find which packages are available
+    apkgs = is_available(module, repoq, pkgs, conf_file, qf=myqf, en_repos=en_repos, dis_repos=dis_repos, group=True)
+
+    # If any available packages are not in installed packages, this means theres a new package to install (not an update)
+    for pkg in apkgs:
+        if not pkg in ipkgs:
+            print pkg
+            return True
+
+    return False
+
 def install(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
 
     pkgs = []
@@ -556,6 +612,13 @@ def install(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
         elif  spec.startswith('@'):
             # complete wild ass guess b/c it's a group
             pkg = spec
+
+            if module.check_mode:
+                # Check if group has available packages
+                if group_has_available(module, repoq, spec, conf_file, en_repos, dis_repos):
+                    module.exit_json(changed=True)
+                else:
+                    module.exit_json(changed=False)
 
         # range requires or file-requires or pkgname :(
         else:
@@ -729,9 +792,17 @@ def latest(module, items, repoq, yum_basecmd, conf_file, en_repos, dis_repos):
         pkg = None
         basecmd = 'update'
         cmd = ''
+
         # groups, again
         if spec.startswith('@'):
             pkg = spec
+
+            if module.check_mode:
+                # Check if group has packages that needs to be updated
+                if group_has_available(module, repoq, spec, conf_file, en_repos, dis_repos):
+                    module.exit_json(changed=True)
+                else:
+                    module.exit_json(changed=False)
         
         elif spec == '*': #update all
             # use check-update to see if there is any need
